@@ -13,6 +13,7 @@ import config
 logger = logging.getLogger(__name__)
 
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
+DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
 
 
@@ -108,14 +109,18 @@ async def scan_dexscreener_trending(session: aiohttp.ClientSession) -> list[dict
                 if parsed:
                     tokens.append(parsed)
 
-        # Also fetch boosted/trending tokens
-        boosted_url = f"{DEXSCREENER_BASE}/tokens/trending/{chain}"
-        boosted = await fetch_json(session, boosted_url)
-        if boosted and "pairs" in boosted:
-            for pair in boosted["pairs"]:
-                parsed = _parse_dexscreener_pair(pair)
-                if parsed:
-                    tokens.append(parsed)
+    # Fetch top boosted tokens (endpoint valide DexScreener v1)
+    boosted = await fetch_json(session, DEXSCREENER_BOOSTS_URL)
+    if boosted and isinstance(boosted, list):
+        addresses = [b.get("tokenAddress", "") for b in boosted if b.get("chainId", "").lower() in [c.lower() for c in config.TARGET_CHAINS]]
+        if addresses:
+            chunk = ",".join(addresses[:30])
+            data2 = await fetch_json(session, f"{DEXSCREENER_BASE}/tokens/{chunk}")
+            if data2 and "pairs" in data2:
+                for pair in data2["pairs"]:
+                    parsed = _parse_dexscreener_pair(pair)
+                    if parsed:
+                        tokens.append(parsed)
 
     # Deduplicate by address
     seen = set()
