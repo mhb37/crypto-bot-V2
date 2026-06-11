@@ -9,10 +9,16 @@ import signal
 import sys
 from datetime import datetime, timezone
 
+# ── Chemins dynamiques depuis les variables d'environnement ──────────────────
+_db_path    = os.getenv("DB_PATH",    "data/trading.db")
+_model_path = os.getenv("MODEL_PATH", "models/scoring_model.pkl")
+_data_dir   = os.path.dirname(os.path.abspath(_db_path))
+_model_dir  = os.path.dirname(os.path.abspath(_model_path))
+
 # ── Créer les dossiers avant TOUT (y compris le FileHandler) ─────────────────
-os.makedirs("data", exist_ok=True)
-os.makedirs("data/reports", exist_ok=True)
-os.makedirs("models", exist_ok=True)
+os.makedirs(_data_dir, exist_ok=True)
+os.makedirs(os.path.join(_data_dir, "reports"), exist_ok=True)
+os.makedirs(_model_dir, exist_ok=True)
 
 # ── Logging — après makedirs pour que FileHandler ne plante pas ───────────────
 logging.basicConfig(
@@ -21,7 +27,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("data/bot.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(_data_dir, "bot.log"), encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("main")
