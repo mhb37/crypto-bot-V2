@@ -36,8 +36,10 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
             stats["too_old"] += 1
             continue
 
-        # ── Liquidity filter ─────────────────────────────────────────────────
-        if liq < config.MIN_LIQUIDITY_USD:
+        # ── Liquidity filter (seuil par chain) ───────────────────────────────
+        chain = token.get("chain", "solana").lower()
+        min_liq = config.MIN_LIQUIDITY_PER_CHAIN.get(chain, config.MIN_LIQUIDITY_USD)
+        if liq < min_liq:
             stats["low_liquidity"] += 1
             continue
 
