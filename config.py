@@ -43,4 +43,11 @@ JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "100"))  # 1%
 WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
 
 # ── Chain filter ──────────────────────────────────────────────────────────────
-TARGET_CHAINS = os.getenv("TARGET_CHAINS", "solana").split(",")   # solana,bsc,eth
+TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "solana,bsc,eth").split(",")]
+
+# Seuils de liquidité par chain (ETH coûte cher en gas → exige plus de liquidité)
+MIN_LIQUIDITY_PER_CHAIN = {
+    "solana": float(os.getenv("MIN_LIQUIDITY_SOLANA", "10000")),
+    "bsc":    float(os.getenv("MIN_LIQUIDITY_BSC",    "15000")),
+    "eth":    float(os.getenv("MIN_LIQUIDITY_ETH",    "50000")),
+}
