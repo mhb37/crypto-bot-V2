@@ -43,6 +43,11 @@ _running = True
 _trader = None          # PaperTrader | LiveTrader selon TRADING_MODE
 _last_report_day = -1
 
+# Déduplication des signaux : adresse → datetime de la dernière notification
+# Évite d'envoyer le même token sur Telegram à chaque scan (toutes les 5 min)
+_notified_signals: dict = {}          # {address: datetime}
+_SIGNAL_COOLDOWN_HOURS = 4            # on ne re-notifie pas le même token avant 4h
+
 
 def handle_shutdown(signum, frame):
     global _running
@@ -140,10 +145,34 @@ async def _one_scan_cycle():
     else:
         for token in scored:
             score = token["ai_score"]
+            address = token.get("address", "")
+
+            # Enregistrer le signal en DB (toujours, pour les stats ML)
             db.record_signal(token, score)
 
             if score < config.MIN_SCORE_TO_TRADE:
                 continue
+
+            # ── Déduplication : ne pas re-notifier le même token avant 4h ──
+            last_notified = _notified_signals.get(address)
+            cooldown = timedelta(hours=_SIGNAL_COOLDOWN_HOURS)
+            already_notified = last_notified and (now - last_notified) < cooldown
+
+            if already_notified:
+                logger.debug(
+                    "Signal %s déjà notifié il y a %.0fmin — ignoré",
+                    token["symbol"],
+                    (now - last_notified).total_seconds() / 60,
+                )
+                continue
+
+            # Nouvelle détection ou cooldown expiré → notifier
+            _notified_signals[address] = now
+            # Nettoyage mémoire : supprimer les entrées > 24h
+            cutoff = now - timedelta(hours=24)
+            stale = [a for a, t in _notified_signals.items() if t < cutoff]
+            for a in stale:
+                del _notified_signals[a]
 
             await tg.notify_signal(token, score)
 
