@@ -12,7 +12,8 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
-OPTIMIZER_STATE_PATH = "data/optimizer_state.json"
+import os as _os, config as _cfg
+OPTIMIZER_STATE_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(_cfg.DB_PATH)), "optimizer_state.json")
 MIN_TRADES_TO_OPTIMIZE = 10
 
 
