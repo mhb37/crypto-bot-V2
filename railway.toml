@@ -2,9 +2,9 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python main.py"
+startCommand = "python3 main.py"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
 
 [environments.production.deploy]
-startCommand = "python main.py"
+startCommand = "python3 main.py"
