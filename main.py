@@ -35,6 +35,8 @@ from trader.paper_trader import PaperTrader
 from notifier import telegram_bot as tg
 from reporter.daily_report import generate_daily_report
 from reporter.learner import should_retrain, run_retraining
+from reporter.optimizer import run_optimization
+from reporter.ai_analyzer import run_ai_analysis
 
 # ── Global state ──────────────────────────────────────────────────────────────
 _running = True
@@ -184,18 +186,44 @@ def _check_close_trades(current_prices: dict) -> list:
 
 
 async def report_scheduler():
-    """Envoie le rapport quotidien à l'heure configurée."""
+    """Envoie le rapport quotidien + optimisation IA à l'heure configurée."""
     global _last_report_day
     while _running:
         now = datetime.now(timezone.utc)
         if now.hour == config.REPORT_HOUR_UTC and _last_report_day != now.day:
             logger.info("Génération du rapport quotidien...")
             try:
+                # 1. Rapport classique
                 report = generate_daily_report()
                 await tg.notify_daily_report(report)
                 _last_report_day = now.day
             except Exception as e:
                 logger.error("Erreur rapport quotidien: %s", e)
+
+            try:
+                # 2. Auto-optimiseur — ajuste les paramètres selon les résultats
+                logger.info("Lancement de l'optimiseur...")
+                optimizer_result = run_optimization()
+                changes = optimizer_result.get("changes", [])
+                if changes:
+                    change_lines = "\n".join(
+                        f"• {c['param']}: {c['old']} → <b>{c['new']}</b>\n  ↳ {c['reason']}"
+                        for c in changes
+                    )
+                    await tg.send(
+                        f"🔧 <b>Paramètres optimisés automatiquement</b>\n\n{change_lines}"
+                    )
+            except Exception as e:
+                logger.error("Erreur optimiseur: %s", e)
+
+            try:
+                # 3. Analyse IA — patterns + recommandations sur Telegram
+                logger.info("Lancement de l'analyse IA...")
+                ai_message = await run_ai_analysis(optimizer_result)
+                await tg.send(ai_message)
+            except Exception as e:
+                logger.error("Erreur analyse IA: %s", e)
+
         await asyncio.sleep(60)
 
 
