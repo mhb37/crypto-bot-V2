@@ -135,7 +135,7 @@ async def scan_dexscreener_trending(session: aiohttp.ClientSession) -> list[dict
 
 async def scan_geckoterminal(session: aiohttp.ClientSession) -> list[dict]:
     """Récupère les trending pools GeckoTerminal pour les chains cibles."""
-    chain_map = {"solana": "solana", "bsc": "bsc", "eth": "eth"}
+    chain_map = {"solana": "solana", "bsc": "bsc", "eth": "eth", "ethereum": "eth"}
     tokens = []
 
     for chain in config.TARGET_CHAINS:
