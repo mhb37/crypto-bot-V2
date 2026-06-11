@@ -12,7 +12,8 @@ from analyzer.model import get_model
 
 logger = logging.getLogger(__name__)
 
-REPORTS_DIR = "data/reports"
+import config as _cfg
+REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(_cfg.DB_PATH)), "reports")
 
 
 def generate_daily_report() -> dict:
