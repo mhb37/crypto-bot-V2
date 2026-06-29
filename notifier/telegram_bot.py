@@ -1,8 +1,5 @@
 """
 Bot Telegram — notifications temps réel + commandes interactives.
-Utilise python-telegram-bot v20+ (async).
-
-Sécurité : seul le TELEGRAM_CHAT_ID configuré peut envoyer des commandes.
 """
 import logging
 from datetime import datetime, timezone
@@ -12,6 +9,7 @@ from typing import Optional
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
+import aiohttp
 
 import config
 import database as db
@@ -21,63 +19,44 @@ logger = logging.getLogger(__name__)
 _app: Optional[Application] = None
 _bot: Optional[Bot] = None
 _paused = False
+_trader_ref = None  # référence au trader pour accéder aux prix
+
+
+def set_trader(trader):
+    """Appelé depuis main.py pour donner accès au trader."""
+    global _trader_ref
+    _trader_ref = trader
 
 
 def is_paused() -> bool:
     return _paused
 
 
-# ── Décorateur de sécurité ────────────────────────────────────────────────────
-
 def authorized_only(func):
-    """
-    Décorateur qui vérifie que la commande provient du TELEGRAM_CHAT_ID autorisé.
-    Rejette silencieusement toute commande d'un autre utilisateur.
-    """
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_chat:
             return
         caller_id = str(update.effective_chat.id)
         allowed_id = str(config.TELEGRAM_CHAT_ID).strip()
-
         if not allowed_id:
-            # Pas de CHAT_ID configuré — rejeter toute commande externe
-            logger.warning(
-                "Commande reçue de %s mais TELEGRAM_CHAT_ID non configuré — rejetée",
-                caller_id,
-            )
             return
-
         if caller_id != allowed_id:
-            logger.warning(
-                "Commande non autorisée reçue de chat_id=%s (attendu: %s)",
-                caller_id, allowed_id,
-            )
-            return  # Pas de réponse — ne pas révéler l'existence du bot
-
+            logger.warning("Commande non autorisée de %s", caller_id)
+            return
         return await func(update, context)
     return wrapper
 
 
-# ── Initialisation ────────────────────────────────────────────────────────────
-
 async def init_telegram() -> bool:
-    """Initialise le bot Telegram. Retourne True si succès."""
     global _app, _bot
-
     if not config.TELEGRAM_BOT_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN non configuré — notifications désactivées")
+        logger.warning("TELEGRAM_BOT_TOKEN non configuré")
         return False
-
-    if not config.TELEGRAM_CHAT_ID:
-        logger.warning("TELEGRAM_CHAT_ID non configuré — les commandes seront toutes rejetées")
-
     try:
         _bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
         info = await _bot.get_me()
         logger.info("Bot Telegram connecté: @%s", info.username)
-
         _app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
         _app.add_handler(CommandHandler("start", cmd_start))
         _app.add_handler(CommandHandler("status", cmd_status))
@@ -86,7 +65,6 @@ async def init_telegram() -> bool:
         _app.add_handler(CommandHandler("pause", cmd_pause))
         _app.add_handler(CommandHandler("resume", cmd_resume))
         _app.add_handler(CommandHandler("help", cmd_help))
-
         return True
     except Exception as e:
         logger.error("Erreur init Telegram: %s", e)
@@ -109,9 +87,7 @@ async def stop_polling():
 
 
 async def send(text: str, parse_mode: str = ParseMode.HTML) -> bool:
-    """Envoie un message au chat autorisé."""
     if not _bot or not config.TELEGRAM_CHAT_ID:
-        logger.debug("Telegram désactivé — message ignoré: %s", text[:50])
         return False
     try:
         await _bot.send_message(
@@ -124,6 +100,28 @@ async def send(text: str, parse_mode: str = ParseMode.HTML) -> bool:
     except Exception as e:
         logger.error("Erreur envoi Telegram: %s", e)
         return False
+
+
+async def _fetch_current_prices(addresses: list[str]) -> dict[str, float]:
+    """Fetch les prix live depuis DexScreener pour /positions."""
+    prices = {}
+    if not addresses:
+        return prices
+    try:
+        chunk = ",".join(addresses[:30])
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{chunk}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for pair in data.get("pairs", []):
+                        addr = pair.get("baseToken", {}).get("address", "")
+                        price = float(pair.get("priceUsd", 0) or 0)
+                        if addr and price > 0 and addr not in prices:
+                            prices[addr] = price
+    except Exception as e:
+        logger.warning("Erreur fetch prix /positions: %s", e)
+    return prices
 
 
 # ── Messages formatés ─────────────────────────────────────────────────────────
@@ -153,8 +151,7 @@ async def notify_trade_open(trade: dict):
         f"Entrée: <b>${trade['entry_price']:.8f}</b>\n"
         f"Taille: <b>${trade['position_usd']:.2f}</b>\n"
         f"Score IA: <b>{trade['ai_score']}/100</b>\n\n"
-        f"🎯 TP: +{config.TAKE_PROFIT_PCT*100:.0f}% | "
-        f"🛑 SL: -{config.STOP_LOSS_PCT*100:.0f}%"
+        f"🎯 TP: +30% | 🛑 SL: -10% | ⏰ 24h"
     )
     await send(text)
 
@@ -195,21 +192,19 @@ async def notify_daily_report(report: dict):
         f"<b>{stats.get('open_positions', 0)}</b> ouverts\n\n"
         f"🔥 Meilleur: <b>{stats.get('best_trade_pct', 0) or 0:+.1f}%</b>\n"
         f"💔 Pire: <b>{stats.get('worst_trade_pct', 0) or 0:+.1f}%</b>\n\n"
-        f"🤖 Modèle: <b>{report.get('model_mode', 'heuristique')}</b>\n"
-        f"📁 Rapport HTML: <code>data/reports/report_{report.get('date', '')}.html</code>"
+        f"🤖 Modèle: <b>{report.get('model_mode', 'heuristique')}</b>"
     )
     await send(text)
 
 
-# ── Commandes (toutes protégées par @authorized_only) ─────────────────────────
+# ── Commandes ─────────────────────────────────────────────────────────────────
 
 @authorized_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Meme Coin Bot actif!</b>\n\n"
-        "Commandes disponibles:\n"
         "/status — État du bot\n"
-        "/positions — Positions ouvertes\n"
+        "/positions — Positions + PnL live\n"
         "/pnl — Performances\n"
         "/pause — Mettre en pause\n"
         "/resume — Reprendre\n"
@@ -231,24 +226,66 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Portfolio: <b>${config.INITIAL_PORTFOLIO + (stats.get('total_pnl_usd') or 0):.2f}</b>\n"
         f"PnL total: <b>{'+' if (stats.get('total_pnl_usd') or 0) >= 0 else ''}"
         f"{(stats.get('total_pnl_usd') or 0):.2f} USD</b>\n"
-        f"Positions ouvertes: <b>{stats.get('open_positions', 0)}/{config.MAX_OPEN_POSITIONS}</b>"
+        f"Positions: <b>{stats.get('open_positions', 0)}/{config.MAX_OPEN_POSITIONS}</b>\n\n"
+        f"Stratégie: TP +30% | SL -10% | ⏰ 24h"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 @authorized_only
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche les positions avec PnL temps réel."""
     open_trades = db.get_open_trades()
     if not open_trades:
         await update.message.reply_text("Aucune position ouverte actuellement.")
         return
+
+    await update.message.reply_text("⏳ Récupération des prix en cours...")
+
+    # Fetch prix live
+    addresses = [t["token_address"] for t in open_trades]
+    prices = await _fetch_current_prices(addresses)
+
     lines = ["📋 <b>POSITIONS OUVERTES</b>\n"]
+    total_pnl_usd = 0.0
+
     for t in open_trades:
+        addr = t["token_address"]
+        entry = t["entry_price"]
+        current = prices.get(addr, 0)
+
+        if current > 0 and entry > 0:
+            pnl_pct = ((current - entry) / entry) * 100
+            pnl_usd = t["position_usd"] * (pnl_pct / 100)
+            pnl_emoji = "🟢" if pnl_pct > 0 else "🔴"
+            pnl_str = f"{pnl_emoji} <b>{pnl_pct:+.1f}% ({'+' if pnl_usd > 0 else ''}{pnl_usd:.2f}$)</b>"
+        else:
+            pnl_str = "⚪ Prix indisponible"
+            pnl_usd = 0.0
+
+        total_pnl_usd += pnl_usd
+
+        # Temps restant avant timeout
+        open_at = datetime.fromisoformat(t["open_at"])
+        if open_at.tzinfo is None:
+            open_at = open_at.replace(tzinfo=timezone.utc)
+        elapsed_h = (datetime.now(timezone.utc) - open_at).total_seconds() / 3600
+        remaining_h = max(0, 24 - elapsed_h)
+
         lines.append(
-            f"• <b>{t['token_symbol']}</b> #{t['id']} — "
-            f"Entrée: ${t['entry_price']:.8f} — "
-            f"${t['position_usd']:.2f} — {t['open_at'][:10]}"
+            f"• <b>{t['token_symbol']}</b> #{t['id']}\n"
+            f"  Entrée: ${entry:.8f}\n"
+            f"  Actuel: ${current:.8f if current > 0 else '—'}\n"
+            f"  PnL: {pnl_str}\n"
+            f"  Taille: ${t['position_usd']:.2f} | ⏰ {remaining_h:.0f}h restantes\n"
         )
+
+    total_emoji = "🟢" if total_pnl_usd > 0 else "🔴"
+    lines.append(
+        f"\n{total_emoji} <b>PnL total non réalisé: "
+        f"{'+' if total_pnl_usd > 0 else ''}{total_pnl_usd:.2f}$</b>"
+    )
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -259,12 +296,13 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pnl_emoji = "📈" if pnl >= 0 else "📉"
     recent = db.get_closed_trades(limit=5)
     recent_lines = [
-        f"  {'🟢' if (t.get('pnl_pct') or 0) > 0 else '🔴'} {t['token_symbol']}: {(t.get('pnl_pct') or 0):+.1f}%"
+        f"  {'🟢' if (t.get('pnl_pct') or 0) > 0 else '🔴'} "
+        f"{t['token_symbol']}: {(t.get('pnl_pct') or 0):+.1f}%"
         for t in recent
     ]
     text = (
         f"{pnl_emoji} <b>PERFORMANCES</b>\n\n"
-        f"PnL total: <b>{'+' if pnl >= 0 else ''}{pnl:.2f} USD</b>\n"
+        f"PnL réalisé: <b>{'+' if pnl >= 0 else ''}{pnl:.2f} USD</b>\n"
         f"Win Rate: <b>{stats.get('win_rate', 0):.1f}%</b>\n"
         f"Total trades: <b>{stats.get('total_trades', 0)}</b>\n"
         f"Meilleur: <b>{stats.get('best_trade_pct', 0) or 0:+.1f}%</b>\n"
@@ -279,37 +317,33 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _paused
     _paused = True
-    await update.message.reply_text(
-        "⏸ Bot mis en <b>pause</b>. Aucun nouveau trade ne sera ouvert.",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text("⏸ Bot en <b>pause</b>.", parse_mode=ParseMode.HTML)
 
 
 @authorized_only
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _paused
     _paused = False
-    await update.message.reply_text("▶️ Bot <b>repris</b>. Scanning actif.", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("▶️ Bot <b>repris</b>.", parse_mode=ParseMode.HTML)
 
 
 @authorized_only
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 <b>AIDE</b>\n\n"
-        "/start — Démarrer / message d'accueil\n"
-        "/status — État général du bot\n"
-        "/positions — Positions ouvertes en cours\n"
-        "/pnl — Résultats et statistiques\n"
-        "/pause — Suspendre les nouveaux trades\n"
-        "/resume — Reprendre les trades\n"
-        "/help — Afficher cette aide\n\n"
-        f"Mode actuel: <b>{config.TRADING_MODE.upper()}</b>\n"
-        f"Score minimum: <b>{config.MIN_SCORE_TO_TRADE}/100</b>"
+        "/start — Message d'accueil\n"
+        "/status — État général\n"
+        "/positions — Positions + PnL live\n"
+        "/pnl — Résultats réalisés\n"
+        "/pause — Suspendre les trades\n"
+        "/resume — Reprendre\n"
+        "/help — Cette aide\n\n"
+        f"Mode: <b>{config.TRADING_MODE.upper()}</b>\n"
+        f"Score min: <b>{config.MIN_SCORE_TO_TRADE}/100</b>\n"
+        f"Stratégie: TP +30% | SL -10% | ⏰ 24h"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _score_bar(score: int) -> str:
     filled = round(score / 10)
