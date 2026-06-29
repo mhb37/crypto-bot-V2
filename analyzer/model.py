@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score
@@ -76,7 +76,6 @@ class ScoringModel:
             try:
                 X = self.scaler.transform([features])
                 proba = self.model.predict_proba(X)[0]
-                # proba[1] = probabilité de succès
                 score = int(round(proba[1] * 100))
                 return max(0, min(100, score))
             except Exception as e:
@@ -100,12 +99,13 @@ class ScoringModel:
         feature_dict = dict(zip(FEATURE_NAMES, features))
         total_weight = sum(weights.values())
         score = sum(feature_dict.get(k, 0) * w for k, w in weights.items())
-        return int(round((score / total_weight) * 100))
+        raw = (score / total_weight) * 100
+        # ← CORRIGÉ : plancher à 40 pour tout token ayant passé les filtres
+        return int(round(max(raw, 40)))
 
     def train(self, trades: list[dict]) -> dict:
         """
         Entraîne le modèle sur les trades historiques.
-        trades: liste de dicts avec les données du token + label 'success' (bool).
         """
         if len(trades) < config.MIN_TRADES_FOR_RETRAIN:
             logger.info(
@@ -145,7 +145,6 @@ class ScoringModel:
         self.training_samples = len(trades)
         self._save()
 
-        # Feature importance
         importances = dict(zip(FEATURE_NAMES, self.model.feature_importances_))
         top_features = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:5]
 
@@ -183,7 +182,6 @@ class ScoringModel:
         }
 
 
-# Singleton global
 _model_instance: Optional[ScoringModel] = None
 
 
