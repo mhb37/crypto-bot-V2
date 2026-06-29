@@ -1,6 +1,5 @@
 """
 Scanner DexScreener & GeckoTerminal — APIs 100% gratuites.
-Retourne une liste de tokens candidats selon les critères de config.
 """
 import asyncio
 import logging
@@ -16,6 +15,9 @@ DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
 DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
 
+# ← CORRIGÉ : plusieurs termes de recherche pour élargir le scan
+SEARCH_QUERIES = ["meme", "pepe", "dog", "cat", "sol", "moon", "ai", "inu"]
+
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, params: dict = None) -> Optional[dict]:
     try:
@@ -30,15 +32,13 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: dict = No
 
 
 def _age_hours(pair_created_at_ms: Optional[int]) -> float:
-    """Retourne l'âge du token en heures."""
     if not pair_created_at_ms:
-        return 9999
+        return 48  # ← CORRIGÉ : valeur neutre au lieu de 9999
     created = datetime.fromtimestamp(pair_created_at_ms / 1000, tz=timezone.utc)
     return (datetime.now(timezone.utc) - created).total_seconds() / 3600
 
 
 def _parse_dexscreener_pair(pair: dict) -> Optional[dict]:
-    """Convertit un pair DexScreener en token normalisé."""
     try:
         chain = pair.get("chainId", "").lower()
         if chain not in [c.lower() for c in config.TARGET_CHAINS]:
@@ -98,21 +98,26 @@ def _parse_dexscreener_pair(pair: dict) -> Optional[dict]:
 
 
 async def scan_dexscreener_trending(session: aiohttp.ClientSession) -> list[dict]:
-    """Récupère les tokens en tendance sur DexScreener pour les chains cibles."""
     tokens = []
-    for chain in config.TARGET_CHAINS:
+
+    # ← CORRIGÉ : boucle sur plusieurs queries au lieu d'une seule
+    for query in SEARCH_QUERIES:
         url = f"{DEXSCREENER_BASE}/search"
-        data = await fetch_json(session, url, params={"q": "meme"})
+        data = await fetch_json(session, url, params={"q": query})
         if data and "pairs" in data:
             for pair in data["pairs"]:
                 parsed = _parse_dexscreener_pair(pair)
                 if parsed:
                     tokens.append(parsed)
 
-    # Fetch top boosted tokens (endpoint valide DexScreener v1)
+    # Fetch top boosted tokens
     boosted = await fetch_json(session, DEXSCREENER_BOOSTS_URL)
     if boosted and isinstance(boosted, list):
-        addresses = [b.get("tokenAddress", "") for b in boosted if b.get("chainId", "").lower() in [c.lower() for c in config.TARGET_CHAINS]]
+        addresses = [
+            b.get("tokenAddress", "")
+            for b in boosted
+            if b.get("chainId", "").lower() in [c.lower() for c in config.TARGET_CHAINS]
+        ]
         if addresses:
             chunk = ",".join(addresses[:30])
             data2 = await fetch_json(session, f"{DEXSCREENER_BASE}/tokens/{chunk}")
@@ -122,19 +127,19 @@ async def scan_dexscreener_trending(session: aiohttp.ClientSession) -> list[dict
                     if parsed:
                         tokens.append(parsed)
 
-    # Deduplicate by address
+    # Deduplicate
     seen = set()
     unique = []
     for t in tokens:
         if t["address"] and t["address"] not in seen:
             seen.add(t["address"])
             unique.append(t)
+
     logger.info("DexScreener: %d unique tokens found", len(unique))
     return unique
 
 
 async def scan_geckoterminal(session: aiohttp.ClientSession) -> list[dict]:
-    """Récupère les trending pools GeckoTerminal pour les chains cibles."""
     chain_map = {"solana": "solana", "bsc": "bsc", "eth": "eth", "ethereum": "eth"}
     tokens = []
 
@@ -159,7 +164,7 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> list[dict]:
                     created = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
                     age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600
                 else:
-                    age_h = 9999
+                    age_h = 48  # ← CORRIGÉ : valeur neutre
 
                 rel = pool.get("relationships", {})
                 base_token = rel.get("base_token", {}).get("data", {})
@@ -168,7 +173,12 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> list[dict]:
                 h6 = float(price_changes.get("h6", 0) or 0)
                 h24 = float(price_changes.get("h24", 0) or 0)
                 vol_24h = float(volume.get("h24", 0) or 0)
+                vol_1h = float(volume.get("h1", 0) or 0)
                 liq = float(attrs.get("reserve_in_usd", 0) or 0)
+
+                txns = attrs.get("transactions", {})
+                buys_1h = int((txns.get("h1") or {}).get("buys", 0) or 0)
+                sells_1h = int((txns.get("h1") or {}).get("sells", 0) or 0)
 
                 tokens.append({
                     "source": "geckoterminal",
@@ -183,16 +193,17 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> list[dict]:
                     "price_change_6h": h6,
                     "price_change_24h": h24,
                     "liquidity_usd": liq,
-                    "volume_1h": float(volume.get("h1", 0) or 0),
+                    "volume_1h": vol_1h,
                     "volume_6h": float(volume.get("h6", 0) or 0),
                     "volume_24h": vol_24h,
                     "market_cap": float(attrs.get("market_cap_usd", 0) or 0),
                     "age_hours": age_h,
-                    "buys_1h": int(attrs.get("transactions", {}).get("h1", {}).get("buys", 0) or 0),
-                    "sells_1h": int(attrs.get("transactions", {}).get("h1", {}).get("sells", 0) or 0),
-                    "buys_24h": int(attrs.get("transactions", {}).get("h24", {}).get("buys", 0) or 0),
-                    "sells_24h": int(attrs.get("transactions", {}).get("h24", {}).get("sells", 0) or 0),
-                    "buy_sell_ratio_1h": 1.0,
+                    "buys_1h": buys_1h,
+                    "sells_1h": sells_1h,
+                    "buys_24h": int((txns.get("h24") or {}).get("buys", 0) or 0),
+                    "sells_24h": int((txns.get("h24") or {}).get("sells", 0) or 0),
+                    # ← CORRIGÉ : ratio calculé depuis les vraies données
+                    "buy_sell_ratio_1h": buys_1h / max(sells_1h, 1),
                     "url": f"https://www.geckoterminal.com/{gt_chain}/pools/{attrs.get('address', '')}",
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
                 })
@@ -204,7 +215,6 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> list[dict]:
 
 
 async def scan_all() -> list[dict]:
-    """Lance le scan complet (DexScreener + GeckoTerminal) en parallèle."""
     async with aiohttp.ClientSession(headers={"Accept": "application/json"}) as session:
         dex, gecko = await asyncio.gather(
             scan_dexscreener_trending(session),
@@ -218,7 +228,6 @@ async def scan_all() -> list[dict]:
     if isinstance(gecko, list):
         result.extend(gecko)
 
-    # Deduplicate
     seen = set()
     unique = []
     for t in result:
