@@ -49,6 +49,7 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
             continue
 
         # ── Price direction filter ───────────────────────────────────────────
+        # ← CORRIGÉ : élimine seulement si les DEUX périodes sont négatives
         if h1 < config.MIN_PRICE_CHANGE_1H and h24 < config.MIN_PRICE_CHANGE_24H:
             stats["not_rising"] += 1
             continue
@@ -73,7 +74,7 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
 
 def _is_likely_scam(token: dict) -> bool:
     """
-    Heuristiques anti-scam (pas infaillibles mais filtrent les cas évidents).
+    Heuristiques anti-scam.
     Retourne True si le token est probablement un scam.
     """
     liq = token.get("liquidity_usd", 0)
@@ -84,27 +85,27 @@ def _is_likely_scam(token: dict) -> bool:
     sells_1h = token.get("sells_1h", 0)
     market_cap = token.get("market_cap", 0)
 
-    # ── Honeypot heuristic : beaucoup d'achats, quasi aucune vente ───────────
+    # Honeypot : beaucoup d'achats, quasi aucune vente
     if buys_1h > 50 and sells_1h == 0:
         return True
 
-    # ── Volume/Liquidity ratio anormal (wash trading) ─────────────────────────
+    # Wash trading
     if liq > 0 and vol24 / liq > 100:
         return True
 
-    # ── Pump extrême non justifié ────────────────────────────────────────────
+    # Pump extrême non justifié
     if h1 > 500 and vol24 < 10000:
         return True
 
-    # ── Market cap irréaliste vs liquidité ───────────────────────────────────
+    # Market cap irréaliste vs liquidité
     if market_cap > 0 and liq > 0 and market_cap / liq > 1000:
         return True
 
-    # ── Crash récent (-50% 24h) → probablement post-dump ────────────────────
+    # Crash récent post-dump
     if h24 < -50:
         return True
 
-    # ── Pas assez de transactions (fausse activité) ──────────────────────────
+    # Fausse activité
     total_txns_1h = buys_1h + sells_1h
     if vol24 > 100000 and total_txns_1h < 5:
         return True
