@@ -7,13 +7,13 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta  # ← timedelta ajouté
 
 # ── Chemins dynamiques depuis les variables d'environnement ──────────────────
-_db_path    = os.getenv("DB_PATH",    "data/trading.db")
+_db_path = os.getenv("DB_PATH", "data/trading.db")
 _model_path = os.getenv("MODEL_PATH", "models/scoring_model.pkl")
-_data_dir   = os.path.dirname(os.path.abspath(_db_path))
-_model_dir  = os.path.dirname(os.path.abspath(_model_path))
+_data_dir = os.path.dirname(os.path.abspath(_db_path))
+_model_dir = os.path.dirname(os.path.abspath(_model_path))
 
 # ── Créer les dossiers avant TOUT (y compris le FileHandler) ─────────────────
 os.makedirs(_data_dir, exist_ok=True)
@@ -46,13 +46,10 @@ from reporter.ai_analyzer import run_ai_analysis
 
 # ── Global state ──────────────────────────────────────────────────────────────
 _running = True
-_trader = None          # PaperTrader | LiveTrader selon TRADING_MODE
+_trader = None
 _last_report_day = -1
-
-# Déduplication des signaux : adresse → datetime de la dernière notification
-# Évite d'envoyer le même token sur Telegram à chaque scan (toutes les 5 min)
-_notified_signals: dict = {}          # {address: datetime}
-_SIGNAL_COOLDOWN_HOURS = 4            # on ne re-notifie pas le même token avant 4h
+_notified_signals: dict = {}
+_SIGNAL_COOLDOWN_HOURS = 4
 
 
 def handle_shutdown(signum, frame):
@@ -62,10 +59,6 @@ def handle_shutdown(signum, frame):
 
 
 def _init_trader():
-    """
-    Instancie le trader approprié selon TRADING_MODE.
-    Retourne un PaperTrader si le mode live n'est pas correctement configuré.
-    """
     if config.TRADING_MODE == "live":
         if not config.SOLANA_PRIVATE_KEY:
             logger.error(
@@ -92,7 +85,6 @@ async def scan_and_trade_loop():
         "🚀 Bot démarré | Mode: %s | Score min: %d",
         config.TRADING_MODE, config.MIN_SCORE_TO_TRADE
     )
-
     while _running:
         try:
             await _one_scan_cycle()
@@ -100,7 +92,6 @@ async def scan_and_trade_loop():
             break
         except Exception as e:
             logger.error("Erreur boucle principale: %s", e, exc_info=True)
-
         logger.info("Prochain scan dans %ds...", config.SCAN_INTERVAL_SECONDS)
         for _ in range(config.SCAN_INTERVAL_SECONDS):
             if not _running:
@@ -139,7 +130,7 @@ async def _one_scan_cycle():
 
     for t in scored[:5]:
         logger.info(
-            "  📊 %s (%s) | Score: %d | +%.1f%% 1h | +%.1f%% 24h | Liq: $%.0f",
+            " 📊 %s (%s) | Score: %d | +%.1f%% 1h | +%.1f%% 24h | Liq: $%.0f",
             t["symbol"], t["chain"], t["ai_score"],
             t.get("price_change_1h", 0), t.get("price_change_24h", 0),
             t.get("liquidity_usd", 0),
@@ -159,7 +150,7 @@ async def _one_scan_cycle():
             if score < config.MIN_SCORE_TO_TRADE:
                 continue
 
-            # ── Déduplication : ne pas re-notifier le même token avant 4h ──
+            # ── Déduplication ──
             last_notified = _notified_signals.get(address)
             cooldown = timedelta(hours=_SIGNAL_COOLDOWN_HOURS)
             already_notified = last_notified and (now - last_notified) < cooldown
@@ -172,9 +163,9 @@ async def _one_scan_cycle():
                 )
                 continue
 
-            # Nouvelle détection ou cooldown expiré → notifier
             _notified_signals[address] = now
-            # Nettoyage mémoire : supprimer les entrées > 24h
+
+            # Nettoyage mémoire
             cutoff = now - timedelta(hours=24)
             stale = [a for a, t in _notified_signals.items() if t < cutoff]
             for a in stale:
@@ -207,14 +198,12 @@ async def _one_scan_cycle():
 
 
 def _open_trade(token: dict, score: int):
-    """Délègue l'ouverture de trade au trader actif (paper ou live)."""
     if hasattr(_trader, "open_trade"):
         return _trader.open_trade(token, ai_score=score)
     return None
 
 
 def _check_close_trades(current_prices: dict) -> list:
-    """Délègue la vérification des SL/TP au trader actif."""
     if hasattr(_trader, "check_and_close_trades"):
         return _trader.check_and_close_trades(current_prices)
     return []
@@ -227,22 +216,24 @@ async def report_scheduler():
         now = datetime.now(timezone.utc)
         if now.hour == config.REPORT_HOUR_UTC and _last_report_day != now.day:
             logger.info("Génération du rapport quotidien...")
+
+            # 1. Rapport classique
             try:
-                # 1. Rapport classique
                 report = generate_daily_report()
                 await tg.notify_daily_report(report)
                 _last_report_day = now.day
             except Exception as e:
                 logger.error("Erreur rapport quotidien: %s", e)
 
+            # 2. Auto-optimiseur
+            optimizer_result = {}  # ← fix : défini avant le try
             try:
-                # 2. Auto-optimiseur — ajuste les paramètres selon les résultats
                 logger.info("Lancement de l'optimiseur...")
                 optimizer_result = run_optimization()
                 changes = optimizer_result.get("changes", [])
                 if changes:
                     change_lines = "\n".join(
-                        f"• {c['param']}: {c['old']} → <b>{c['new']}</b>\n  ↳ {c['reason']}"
+                        f"• {c['param']}: {c['old']} → <b>{c['new']}</b>\n ↳ {c['reason']}"
                         for c in changes
                     )
                     await tg.send(
@@ -251,8 +242,8 @@ async def report_scheduler():
             except Exception as e:
                 logger.error("Erreur optimiseur: %s", e)
 
+            # 3. Analyse IA
             try:
-                # 3. Analyse IA — patterns + recommandations sur Telegram
                 logger.info("Lancement de l'analyse IA...")
                 ai_message = await run_ai_analysis(optimizer_result)
                 await tg.send(ai_message)
@@ -265,10 +256,8 @@ async def report_scheduler():
 async def main():
     global _trader
 
-    # Initialiser la base de données
     db.init_db()
 
-    # Initialiser le trader (paper ou live selon config)
     _trader, effective_mode = _init_trader()
     logger.info(
         "Trader: %s | Portfolio: $%.2f | Positions max: %d | TP: +%.0f%% | SL: -%.0f%%",
@@ -276,7 +265,6 @@ async def main():
         config.TAKE_PROFIT_PCT * 100, config.STOP_LOSS_PCT * 100,
     )
 
-    # Initialiser Telegram
     tg_ok = await tg.init_telegram()
     if tg_ok:
         await tg.start_polling()
