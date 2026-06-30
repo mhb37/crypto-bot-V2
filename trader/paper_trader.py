@@ -1,7 +1,9 @@
 """
 Moteur de paper trading.
+- Délai de grâce SL : 10 minutes après ouverture, pas de vérification SL
+  (laisse le temps au prix de se stabiliser après le slippage d'entrée).
 - Trailing Stop activé à +15%, distance 10%
-- Multi-TP : 50% à +20% (enregistré en DB via tp1_hit), 50% à +40%
+- Multi-TP : 50% à +20% (enregistré en DB), 50% à +40%
 - Blacklist automatique 48h après SL
 - TP: +30% / SL: -10% / Timeout: 24h
 """
@@ -19,6 +21,9 @@ logger = logging.getLogger(__name__)
 TAKE_PROFIT_PCT      = 0.30
 STOP_LOSS_PCT        = 0.10
 MAX_HOLD_HOURS       = 24
+
+# ← NOUVEAU : délai de grâce avant activation du SL
+SL_GRACE_PERIOD_MINUTES = 10
 
 TRAILING_ACTIVATE    = 0.15
 TRAILING_DISTANCE    = 0.10
@@ -149,8 +154,8 @@ class PaperTrader:
     async def check_and_close_trades(self, current_prices: dict[str, float]) -> list[dict]:
         """
         Vérifie SL / Trailing Stop / Multi-TP / Timeout.
-        Le TP1 est désormais enregistré en DB (tp1_hit) pour l'entraînement ML,
-        sans fermer le trade.
+        Le SL n'est vérifié qu'après SL_GRACE_PERIOD_MINUTES depuis l'ouverture
+        pour laisser le temps au prix de se stabiliser.
         """
         closed = []
         open_trades = db.get_open_trades()
@@ -175,6 +180,13 @@ class PaperTrader:
 
             pnl_pct = ((current_price - entry) / entry) * 100
 
+            # ── Calcul de l'âge du trade (utilisé pour grâce SL + timeout) ────
+            open_at = datetime.fromisoformat(trade["open_at"])
+            if open_at.tzinfo is None:
+                open_at = open_at.replace(tzinfo=timezone.utc)
+            trade_age = datetime.now(timezone.utc) - open_at
+            in_grace_period = trade_age < timedelta(minutes=SL_GRACE_PERIOD_MINUTES)
+
             # ── Mise à jour du prix max (trailing) ────────────────────────
             peak = _peak_prices.get(addr, entry)
             if current_price > peak:
@@ -182,6 +194,8 @@ class PaperTrader:
                 peak = current_price
 
             # ── Trailing Stop Loss ─────────────────────────────────────────
+            # (le trailing ne s'active qu'à +15%, donc le trade a déjà
+            # prouvé un mouvement positif — pas besoin de délai de grâce ici)
             peak_pnl_pct = ((peak - entry) / entry) * 100
             if peak_pnl_pct >= TRAILING_ACTIVATE * 100:
                 trailing_sl_price = peak * (1 - TRAILING_DISTANCE)
@@ -198,8 +212,8 @@ class PaperTrader:
                     closed.append({**closed_trade, "reason": "trailing_stop"})
                     continue
 
-            # ── Stop Loss classique ────────────────────────────────────────
-            if pnl_pct <= -STOP_LOSS_PCT * 100:
+            # ── Stop Loss classique (avec délai de grâce) ───────────────────
+            if not in_grace_period and pnl_pct <= -STOP_LOSS_PCT * 100:
                 slippage = 0.003
                 exit_price = current_price * (1 - slippage)
                 closed_trade = db.close_trade(trade["id"], exit_price, "stop_loss")
@@ -209,11 +223,15 @@ class PaperTrader:
                 _tp1_done.pop(trade_id, None)
                 closed.append({**closed_trade, "reason": "stop_loss"})
                 continue
+            elif in_grace_period and pnl_pct <= -STOP_LOSS_PCT * 100:
+                logger.debug(
+                    "⏳ SL ignoré (grâce) #%d | %s | PnL: %.2f%% | %ds depuis ouverture",
+                    trade["id"], symbol, pnl_pct, trade_age.total_seconds()
+                )
 
             # ── Multi-TP 1 : +20% → enregistré en DB + fermeture 50% notifiée ──
             if pnl_pct >= TP1_PCT * 100 and not _tp1_done.get(trade_id, False):
                 _tp1_done[trade_id] = True
-                # ← CHANGEMENT : on enregistre l'événement en DB pour le ML
                 db.mark_tp1_hit(trade["id"], pnl_pct)
 
                 exit_price = current_price * (1 - 0.005)
@@ -248,11 +266,7 @@ class PaperTrader:
                 continue
 
             # ── Timeout ────────────────────────────────────────────────────
-            open_at = datetime.fromisoformat(trade["open_at"])
-            if open_at.tzinfo is None:
-                open_at = open_at.replace(tzinfo=timezone.utc)
-            age = datetime.now(timezone.utc) - open_at
-            if age > timedelta(hours=MAX_HOLD_HOURS):
+            if trade_age > timedelta(hours=MAX_HOLD_HOURS):
                 slippage = 0.005
                 exit_price = current_price * (1 - slippage)
                 closed_trade = db.close_trade(trade["id"], exit_price, "timeout")
