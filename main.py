@@ -1,6 +1,7 @@
 """
 Point d'entrée principal — Meme Coin Scanner & Trading Bot.
-Inclut : rapport hebdo, alerte BTC, vérification alertes prix.
+Inclut : rapport hebdo, alerte BTC, vérification alertes prix,
+notification spéciale lors du premier passage en mode ML.
 """
 import asyncio
 import logging
@@ -153,7 +154,6 @@ async def _one_scan_cycle():
 
             _notified_signals[address] = now
 
-            # Nettoyage mémoire
             cutoff = now - timedelta(hours=24)
             stale = [a for a, t in _notified_signals.items() if t < cutoff]
             for a in stale:
@@ -173,15 +173,37 @@ async def _one_scan_cycle():
 
     # 8. Réentraînement ML
     if should_retrain():
+        was_trained = model.is_trained  # ← état avant réentraînement
         logger.info("Lancement réentraînement ML...")
         result = run_retraining()
+
         if result.get("status") == "trained":
-            await tg.send(
-                f"🧠 <b>Modèle ML réentraîné</b>\n"
-                f"Accuracy: <b>{result.get('accuracy', 0):.1%}</b>\n"
-                f"Precision: <b>{result.get('precision', 0):.1%}</b>\n"
-                f"Samples: <b>{result.get('samples', 0)}</b>"
-            )
+            now_trained = get_model().is_trained  # ← état après (recharge l'instance)
+
+            if not was_trained and now_trained:
+                # ← Premier passage en mode ML : notification spéciale
+                await tg.send(
+                    f"🧠 <b>BASCULE EN MODE MACHINE LEARNING</b> 🎉\n\n"
+                    f"Le bot vient de passer du scoring heuristique au "
+                    f"RandomForest entraîné sur tes trades historiques.\n\n"
+                    f"📊 Samples: <b>{result.get('samples', 0)}</b>\n"
+                    f"🎯 Accuracy: <b>{result.get('accuracy', 0):.1%}</b>\n"
+                    f"🎯 Precision: <b>{result.get('precision', 0):.1%}</b>\n\n"
+                    f"<i>À partir de maintenant, le scoring des tokens va se "
+                    f"baser sur les patterns appris de tes trades passés, "
+                    f"pas sur la formule fixe d'avant. Surveille bien les "
+                    f"prochains résultats — le comportement du bot peut "
+                    f"changer.</i>\n\n"
+                    f"Vérifiable à tout moment avec /status."
+                )
+            else:
+                # Réentraînement classique (déjà en ML, juste mis à jour)
+                await tg.send(
+                    f"🧠 <b>Modèle ML réentraîné</b>\n"
+                    f"Accuracy: <b>{result.get('accuracy', 0):.1%}</b>\n"
+                    f"Precision: <b>{result.get('precision', 0):.1%}</b>\n"
+                    f"Samples: <b>{result.get('samples', 0)}</b>"
+                )
 
 
 def _open_trade(token: dict, score: int):
