@@ -1,12 +1,14 @@
 """
 Moteur de paper trading.
-- Délai de grâce SL : 10 minutes après ouverture, pas de vérification SL
-  (laisse le temps au prix de se stabiliser après le slippage d'entrée).
+- SL élargi à -15%
+- Délai de grâce SL : 10 minutes
 - Trailing Stop activé à +15%, distance 10%
 - Multi-TP : 50% à +20% (enregistré en DB), 50% à +40%
 - Blacklist automatique 48h après SL
-- TP: +30% / SL: -10% / Timeout: 24h
+- Suivi post-trade : surveille le prix 2h après fermeture
+- Timeout: 24h
 """
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -18,25 +20,32 @@ import database as db
 logger = logging.getLogger(__name__)
 
 # ── Stratégie de sortie ───────────────────────────────────────────────────────
-TAKE_PROFIT_PCT      = 0.30
-STOP_LOSS_PCT        = 0.10
-MAX_HOLD_HOURS       = 24
+TAKE_PROFIT_PCT         = 0.30
+STOP_LOSS_PCT           = 0.15   # ← CHANGEMENT : -10% → -15%
+MAX_HOLD_HOURS          = 24
 
-# ← NOUVEAU : délai de grâce avant activation du SL
 SL_GRACE_PERIOD_MINUTES = 10
 
-TRAILING_ACTIVATE    = 0.15
-TRAILING_DISTANCE    = 0.10
+TRAILING_ACTIVATE       = 0.15
+TRAILING_DISTANCE       = 0.10
 
-TP1_PCT              = 0.20
-TP1_SIZE             = 0.50
-TP2_PCT              = 0.40
+TP1_PCT                 = 0.20
+TP1_SIZE                = 0.50
+TP2_PCT                 = 0.40
 
-BLACKLIST_HOURS      = 48
+BLACKLIST_HOURS         = 48
+
+# ── Suivi post-trade ──────────────────────────────────────────────────────────
+POST_TRADE_FOLLOW_MINUTES = 120   # 2h de suivi après fermeture
+POST_TRADE_CHECK_INTERVAL = 300   # check toutes les 5 min pendant le suivi
 
 _peak_prices: dict[str, float] = {}
 _tp1_done: dict[str, bool] = {}
 _blacklist: dict[str, datetime] = {}
+
+# {token_address: {"closed_trade": dict, "close_price": float,
+#                   "close_time": datetime, "snapshots": list}}
+_post_trade_tracking: dict[str, dict] = {}
 
 
 def is_blacklisted(address: str) -> bool:
@@ -55,6 +64,32 @@ def _add_to_blacklist(address: str, symbol: str):
     logger.info("🚫 Blacklist: %s jusqu'à %s", symbol, expiry.strftime("%H:%M %d/%m"))
 
 
+async def _fetch_price(address: str, chain: str = "solana") -> Optional[float]:
+    """Fetch le prix actuel d'un token depuis DexScreener."""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                pairs = data.get("pairs", [])
+                chain_pairs = [
+                    p for p in pairs
+                    if p.get("chainId", "").lower() == chain.lower()
+                ] or pairs
+                if chain_pairs:
+                    best = max(
+                        chain_pairs,
+                        key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0)
+                    )
+                    price = float(best.get("priceUsd", 0) or 0)
+                    return price if price > 0 else None
+    except Exception as e:
+        logger.warning("Fetch prix post-trade %s: %s", address, e)
+    return None
+
+
 class PaperTrader:
     def __init__(self):
         self.portfolio_value = config.INITIAL_PORTFOLIO
@@ -68,15 +103,12 @@ class PaperTrader:
     def can_trade(self, token_address: str) -> tuple[bool, str]:
         if is_blacklisted(token_address):
             return False, "Token en blacklist (SL récent)"
-
         open_trades = db.get_open_trades()
         if len(open_trades) >= config.MAX_OPEN_POSITIONS:
             return False, f"Max positions atteintes ({config.MAX_OPEN_POSITIONS})"
-
         existing = db.get_trade_by_address(token_address)
         if existing:
             return False, "Position déjà ouverte sur ce token"
-
         return True, "ok"
 
     def open_trade(self, token: dict, ai_score: int) -> dict | None:
@@ -91,7 +123,6 @@ class PaperTrader:
         entry_price = token["price_usd"] * (1 + slippage)
 
         trade_id = db.open_trade(token, entry_price, position_usd, ai_score)
-
         _peak_prices[token["address"]] = entry_price
         _tp1_done[str(trade_id)] = False
 
@@ -111,6 +142,81 @@ class PaperTrader:
             "url": token.get("url", ""),
         }
 
+    def start_post_trade_tracking(self, closed_trade: dict, close_price: float):
+        """
+        Démarre le suivi post-trade pour analyser le comportement du token
+        après la fermeture — permet de diagnostiquer si le SL est trop serré.
+        """
+        addr = closed_trade.get("token_address", "")
+        if not addr:
+            return
+        _post_trade_tracking[addr] = {
+            "closed_trade": closed_trade,
+            "close_price": close_price,
+            "close_time": datetime.now(timezone.utc),
+            "snapshots": [],
+            "chain": closed_trade.get("chain", "solana"),
+        }
+        logger.info(
+            "🔍 Suivi post-trade démarré pour %s pendant %dmin",
+            closed_trade.get("token_symbol", addr),
+            POST_TRADE_FOLLOW_MINUTES
+        )
+
+    async def check_post_trade_tracking(self) -> list[dict]:
+        """
+        Vérifie les tokens en suivi post-trade.
+        Retourne la liste des suivis terminés avec leur résumé.
+        """
+        now = datetime.now(timezone.utc)
+        completed = []
+        to_remove = []
+
+        for addr, tracking in _post_trade_tracking.items():
+            close_time = tracking["close_time"]
+            elapsed = (now - close_time).total_seconds() / 60
+
+            # Suivi terminé après 2h
+            if elapsed >= POST_TRADE_FOLLOW_MINUTES:
+                # Fetch prix final
+                final_price = await _fetch_price(addr, tracking["chain"])
+                if final_price:
+                    tracking["snapshots"].append({
+                        "minutes": round(elapsed),
+                        "price": final_price,
+                    })
+
+                completed.append({
+                    "trade": tracking["closed_trade"],
+                    "close_price": tracking["close_price"],
+                    "snapshots": tracking["snapshots"],
+                    "final_price": final_price or tracking["close_price"],
+                    "duration_minutes": round(elapsed),
+                })
+                to_remove.append(addr)
+                continue
+
+            # Check intermédiaire toutes les 5 min
+            snapshots = tracking["snapshots"]
+            last_check_min = snapshots[-1]["minutes"] if snapshots else 0
+            if elapsed - last_check_min >= POST_TRADE_CHECK_INTERVAL / 60:
+                price = await _fetch_price(addr, tracking["chain"])
+                if price:
+                    tracking["snapshots"].append({
+                        "minutes": round(elapsed),
+                        "price": price,
+                    })
+                    logger.debug(
+                        "Post-trade %s | +%dmin | $%.8f",
+                        tracking["closed_trade"].get("token_symbol", addr),
+                        round(elapsed), price
+                    )
+
+        for addr in to_remove:
+            del _post_trade_tracking[addr]
+
+        return completed
+
     async def fetch_missing_prices(
         self,
         open_trades: list[dict],
@@ -128,7 +234,9 @@ class PaperTrader:
                     chain = trade.get("chain", "solana")
                     url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
                     try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        async with session.get(
+                            url, timeout=aiohttp.ClientTimeout(total=10)
+                        ) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 pairs = data.get("pairs", [])
@@ -139,7 +247,9 @@ class PaperTrader:
                                 if chain_pairs:
                                     best = max(
                                         chain_pairs,
-                                        key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0)
+                                        key=lambda p: float(
+                                            p.get("liquidity", {}).get("usd", 0) or 0
+                                        )
                                     )
                                     price = float(best.get("priceUsd", 0) or 0)
                                     if price > 0:
@@ -152,11 +262,6 @@ class PaperTrader:
         return updated
 
     async def check_and_close_trades(self, current_prices: dict[str, float]) -> list[dict]:
-        """
-        Vérifie SL / Trailing Stop / Multi-TP / Timeout.
-        Le SL n'est vérifié qu'après SL_GRACE_PERIOD_MINUTES depuis l'ouverture
-        pour laisser le temps au prix de se stabiliser.
-        """
         closed = []
         open_trades = db.get_open_trades()
         if not open_trades:
@@ -180,65 +285,62 @@ class PaperTrader:
 
             pnl_pct = ((current_price - entry) / entry) * 100
 
-            # ── Calcul de l'âge du trade (utilisé pour grâce SL + timeout) ────
             open_at = datetime.fromisoformat(trade["open_at"])
             if open_at.tzinfo is None:
                 open_at = open_at.replace(tzinfo=timezone.utc)
             trade_age = datetime.now(timezone.utc) - open_at
             in_grace_period = trade_age < timedelta(minutes=SL_GRACE_PERIOD_MINUTES)
 
-            # ── Mise à jour du prix max (trailing) ────────────────────────
+            # ── Mise à jour peak ──────────────────────────────────────────
             peak = _peak_prices.get(addr, entry)
             if current_price > peak:
                 _peak_prices[addr] = current_price
                 peak = current_price
 
-            # ── Trailing Stop Loss ─────────────────────────────────────────
-            # (le trailing ne s'active qu'à +15%, donc le trade a déjà
-            # prouvé un mouvement positif — pas besoin de délai de grâce ici)
+            # ── Trailing Stop ─────────────────────────────────────────────
             peak_pnl_pct = ((peak - entry) / entry) * 100
             if peak_pnl_pct >= TRAILING_ACTIVATE * 100:
                 trailing_sl_price = peak * (1 - TRAILING_DISTANCE)
                 if current_price <= trailing_sl_price:
-                    slippage = 0.003
-                    exit_price = current_price * (1 - slippage)
+                    exit_price = current_price * (1 - 0.003)
                     closed_trade = db.close_trade(trade["id"], exit_price, "trailing_stop")
                     logger.info(
-                        "📉 Trailing SL #%d | %s | Peak: +%.1f%% | PnL final: %.2f%%",
+                        "📉 Trailing SL #%d | %s | Peak: +%.1f%% | PnL: %.2f%%",
                         trade["id"], symbol, peak_pnl_pct, pnl_pct
                     )
+                    self.start_post_trade_tracking(closed_trade, current_price)
                     _peak_prices.pop(addr, None)
                     _tp1_done.pop(trade_id, None)
                     closed.append({**closed_trade, "reason": "trailing_stop"})
                     continue
 
-            # ── Stop Loss classique (avec délai de grâce) ───────────────────
+            # ── Stop Loss (-15%) avec délai de grâce ─────────────────────
             if not in_grace_period and pnl_pct <= -STOP_LOSS_PCT * 100:
-                slippage = 0.003
-                exit_price = current_price * (1 - slippage)
+                exit_price = current_price * (1 - 0.003)
                 closed_trade = db.close_trade(trade["id"], exit_price, "stop_loss")
                 logger.info("🔴 SL #%d | %s | PnL: %.2f%%", trade["id"], symbol, pnl_pct)
                 _add_to_blacklist(addr, symbol)
+                # ← Démarre le suivi post-trade pour analyser le comportement
+                self.start_post_trade_tracking(closed_trade, current_price)
                 _peak_prices.pop(addr, None)
                 _tp1_done.pop(trade_id, None)
                 closed.append({**closed_trade, "reason": "stop_loss"})
                 continue
             elif in_grace_period and pnl_pct <= -STOP_LOSS_PCT * 100:
                 logger.debug(
-                    "⏳ SL ignoré (grâce) #%d | %s | PnL: %.2f%% | %ds depuis ouverture",
+                    "⏳ SL ignoré (grâce) #%d | %s | %.2f%% | %ds",
                     trade["id"], symbol, pnl_pct, trade_age.total_seconds()
                 )
 
-            # ── Multi-TP 1 : +20% → enregistré en DB + fermeture 50% notifiée ──
+            # ── TP1 : +20% → 50% fermé + enregistré en DB ────────────────
             if pnl_pct >= TP1_PCT * 100 and not _tp1_done.get(trade_id, False):
                 _tp1_done[trade_id] = True
                 db.mark_tp1_hit(trade["id"], pnl_pct)
-
                 exit_price = current_price * (1 - 0.005)
                 partial_usd = trade["position_usd"] * TP1_SIZE
                 partial_pnl_usd = partial_usd * (pnl_pct / 100)
                 logger.info(
-                    "🟡 TP1 #%d | %s | +%.1f%% | Partiel: $%.2f profit (enregistré en DB)",
+                    "🟡 TP1 #%d | %s | +%.1f%% | $%.2f profit",
                     trade["id"], symbol, pnl_pct, partial_pnl_usd
                 )
                 closed.append({
@@ -254,10 +356,9 @@ class PaperTrader:
                 })
                 continue
 
-            # ── Multi-TP 2 : +40% → ferme 100% ───────────────────────────
+            # ── TP2 : +40% → ferme 100% ──────────────────────────────────
             if pnl_pct >= TP2_PCT * 100:
-                slippage = 0.005
-                exit_price = current_price * (1 - slippage)
+                exit_price = current_price * (1 - 0.005)
                 closed_trade = db.close_trade(trade["id"], exit_price, "take_profit")
                 logger.info("🟢 TP2 #%d | %s | PnL: +%.2f%%", trade["id"], symbol, pnl_pct)
                 _peak_prices.pop(addr, None)
@@ -265,12 +366,12 @@ class PaperTrader:
                 closed.append({**closed_trade, "reason": "take_profit"})
                 continue
 
-            # ── Timeout ────────────────────────────────────────────────────
+            # ── Timeout 24h ───────────────────────────────────────────────
             if trade_age > timedelta(hours=MAX_HOLD_HOURS):
-                slippage = 0.005
-                exit_price = current_price * (1 - slippage)
+                exit_price = current_price * (1 - 0.005)
                 closed_trade = db.close_trade(trade["id"], exit_price, "timeout")
                 logger.info("⏰ Timeout #%d | %s | PnL: %.2f%%", trade["id"], symbol, pnl_pct)
+                self.start_post_trade_tracking(closed_trade, current_price)
                 _peak_prices.pop(addr, None)
                 _tp1_done.pop(trade_id, None)
                 closed.append({**closed_trade, "reason": "timeout"})
@@ -297,7 +398,8 @@ class PaperTrader:
             "initial_value": config.INITIAL_PORTFOLIO,
             "total_pnl_usd": stats["total_pnl_usd"],
             "total_pnl_pct": round(
-                (self.portfolio_value - config.INITIAL_PORTFOLIO) / config.INITIAL_PORTFOLIO * 100, 2
+                (self.portfolio_value - config.INITIAL_PORTFOLIO)
+                / config.INITIAL_PORTFOLIO * 100, 2
             ),
             "open_positions": len(open_trades),
             "total_trades": stats["total_trades"],
