@@ -1,10 +1,11 @@
 """
-Filtres de qualité — profil momentum fort.
-Inclut vérification blacklist.
+Filtres de qualité — profil "retracement après pic".
+Cible les tokens qui ont déjà prouvé un fort momentum (h6/h24)
+et viennent de souffler (h1 modéré/négatif) plutôt que les tokens
+en pleine accélération (risque élevé d'acheter le sommet).
 """
 import logging
 import config
-from trader.paper_trader import is_blacklisted
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,8 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
         "low_liquidity": 0,
         "low_volume": 0,
         "not_rising": 0,
-        "weak_momentum": 0,
-        "blacklisted": 0,
+        "no_prior_momentum": 0,
+        "still_pumping": 0,
         "scam_suspect": 0,
         "passed": 0,
     }
@@ -30,16 +31,10 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
         vol24 = token.get("volume_24h", 0)
         vol1h = token.get("volume_1h", 0)
         h1 = token.get("price_change_1h", 0)
+        h6 = token.get("price_change_6h", 0)
         h24 = token.get("price_change_24h", 0)
         buys_1h = token.get("buys_1h", 0)
         sells_1h = token.get("sells_1h", 0)
-        address = token.get("address", "")
-
-        # ── Blacklist ────────────────────────────────────────────────────────
-        if address and is_blacklisted(address):
-            stats["blacklisted"] += 1
-            logger.debug("Blacklisté: %s", token.get("symbol"))
-            continue
 
         # ── Age filter ───────────────────────────────────────────────────────
         if age < config.MIN_AGE_HOURS:
@@ -66,24 +61,34 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
             stats["not_rising"] += 1
             continue
 
-        # ── Momentum fort ────────────────────────────────────────────────────
-        if h1 <= 0:
-            stats["weak_momentum"] += 1
+        # ── Momentum prouvé sur la durée (h6 ou h24 fortement positif) ────────
+        # On veut un token qui a DÉJÀ fait ses preuves, pas un nouveau venu
+        if h6 < 15 and h24 < 20:
+            stats["no_prior_momentum"] += 1
             continue
 
-        if vol24 > 0 and vol1h / vol24 < 0.10:
-            stats["weak_momentum"] += 1
+        # ── Pas en pleine accélération (h1 modéré ou en repli) ─────────────────
+        # On évite d'acheter pile au sommet du pic — h1 trop fort = signal
+        # qu'on arrive après la bataille, juste avant le retournement.
+        if h1 > 15:
+            stats["still_pumping"] += 1
             continue
 
+        # ── Volume encore présent (le token n'est pas mort après le pic) ──────
+        if vol24 > 0 and vol1h / vol24 < 0.04:
+            stats["no_prior_momentum"] += 1
+            continue
+
+        # ── Pas de vente panique massive (sells dominants = vraie chute) ──────
         total_txns = buys_1h + sells_1h
-        if total_txns > 0 and buys_1h / max(total_txns, 1) < 0.55:
-            stats["weak_momentum"] += 1
+        if total_txns > 0 and sells_1h / max(total_txns, 1) > 0.65:
+            stats["still_pumping"] += 1
             continue
 
         # ── Anti-scam ────────────────────────────────────────────────────────
         if _is_likely_scam(token):
             stats["scam_suspect"] += 1
-            logger.debug("Scam suspect: %s (%s)", token.get("symbol"), address)
+            logger.debug("Scam suspect: %s (%s)", token.get("symbol"), token.get("address"))
             continue
 
         stats["passed"] += 1
@@ -91,11 +96,11 @@ def apply_filters(tokens: list[dict]) -> list[dict]:
 
     logger.info(
         "Filter stats: total=%d, passed=%d, too_young=%d, too_old=%d, "
-        "low_liq=%d, low_vol=%d, not_rising=%d, weak_momentum=%d, "
-        "blacklisted=%d, scam=%d",
+        "low_liq=%d, low_vol=%d, not_rising=%d, no_prior_momentum=%d, "
+        "still_pumping=%d, scam=%d",
         stats["total"], stats["passed"], stats["too_young"], stats["too_old"],
         stats["low_liquidity"], stats["low_volume"], stats["not_rising"],
-        stats["weak_momentum"], stats["blacklisted"], stats["scam_suspect"],
+        stats["no_prior_momentum"], stats["still_pumping"], stats["scam_suspect"],
     )
     return results
 
