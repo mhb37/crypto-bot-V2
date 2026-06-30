@@ -1,7 +1,11 @@
 """
 Point d'entrée principal — Meme Coin Scanner & Trading Bot.
-Inclut : rapport hebdo, alerte BTC, vérification alertes prix,
-notification spéciale lors du premier passage en mode ML.
+
+Fix important : la vérification des positions ouvertes (SL/TP/Trailing/Timeout)
+se fait désormais à CHAQUE cycle, même si aucun token ne passe les filtres.
+Avant ce fix, un cycle sans token filtré sortait trop tôt et sautait
+complètement la vérification des positions, permettant à un SL de dépasser
+largement son seuil avant d'être détecté.
 """
 import asyncio
 import logging
@@ -93,19 +97,20 @@ async def _one_scan_cycle():
 
     # 1. Scanner
     raw_tokens = await scan_all()
+
     if not raw_tokens:
         logger.info("Aucun token trouvé")
+        # ← FIX : même sans tokens scannés, on vérifie les positions ouvertes
+        closed_trades = await _check_close_trades({})
+        for ct in closed_trades:
+            await tg.notify_trade_close(ct)
         return
 
     # 2. Filtrer
     filtered = apply_filters(raw_tokens)
-    if not filtered:
-        logger.info("Aucun token après filtrage")
-        return
-
     logger.info("%d tokens après filtrage", len(filtered))
 
-    # 3. Scorer
+    # 3. Scorer les tokens filtrés
     model = get_model()
     scored = []
     for token in filtered:
@@ -122,17 +127,31 @@ async def _one_scan_cycle():
             t.get("price_change_1h", 0), t.get("liquidity_usd", 0),
         )
 
-    # 4. Prix courants pour alertes et positions
+    # ← FIX : current_prices vient de TOUS les tokens scannés (raw_tokens),
+    #    pas seulement ceux qui passent les filtres. Une position ouverte
+    #    sur un token qui ne passe plus les filtres doit quand même
+    #    être surveillée pour SL/TP/Trailing/Timeout.
     current_prices = {
         t["address"]: t["price_usd"]
-        for t in scored
+        for t in raw_tokens
         if t.get("address") and t.get("price_usd", 0) > 0
     }
 
-    # 5. Vérifier alertes de prix
+    # 4. Vérifier alertes de prix
     await tg.check_price_alerts(current_prices)
 
-    # 6. Signaux et trades
+    # ── 5. Vérifier les positions AVANT tout traitement des signaux ────────
+    #    Cette étape ne dépend plus de filtered — elle se fait toujours.
+    closed_trades = await _check_close_trades(current_prices)
+    for ct in closed_trades:
+        await tg.notify_trade_close(ct)
+
+    # 6. Si aucun token filtré, pas de nouveau signal possible — on s'arrête là
+    if not filtered:
+        logger.info("Aucun token après filtrage — pas de nouveau signal")
+        return
+
+    # 7. Signaux et trades
     if tg.is_paused():
         logger.info("Bot en pause — pas de nouveau trade")
     else:
@@ -166,22 +185,16 @@ async def _one_scan_cycle():
                 await tg.notify_trade_open(trade)
                 db.record_signal(token, score, acted=True, reason="trade_opened")
 
-    # 7. Vérifier positions (SL / Trailing / Multi-TP / Timeout)
-    closed_trades = await _check_close_trades(current_prices)
-    for ct in closed_trades:
-        await tg.notify_trade_close(ct)
-
     # 8. Réentraînement ML
     if should_retrain():
-        was_trained = model.is_trained  # ← état avant réentraînement
+        was_trained = model.is_trained
         logger.info("Lancement réentraînement ML...")
         result = run_retraining()
 
         if result.get("status") == "trained":
-            now_trained = get_model().is_trained  # ← état après (recharge l'instance)
+            now_trained = get_model().is_trained
 
             if not was_trained and now_trained:
-                # ← Premier passage en mode ML : notification spéciale
                 await tg.send(
                     f"🧠 <b>BASCULE EN MODE MACHINE LEARNING</b> 🎉\n\n"
                     f"Le bot vient de passer du scoring heuristique au "
@@ -197,7 +210,6 @@ async def _one_scan_cycle():
                     f"Vérifiable à tout moment avec /status."
                 )
             else:
-                # Réentraînement classique (déjà en ML, juste mis à jour)
                 await tg.send(
                     f"🧠 <b>Modèle ML réentraîné</b>\n"
                     f"Accuracy: <b>{result.get('accuracy', 0):.1%}</b>\n"
