@@ -1,11 +1,14 @@
 """
 Point d'entrée principal — Meme Coin Scanner & Trading Bot.
 
-Fix important : la vérification des positions ouvertes (SL/TP/Trailing/Timeout)
-se fait désormais à CHAQUE cycle, même si aucun token ne passe les filtres.
-Avant ce fix, un cycle sans token filtré sortait trop tôt et sautait
-complètement la vérification des positions, permettant à un SL de dépasser
-largement son seuil avant d'être détecté.
+Architecture à 3 boucles parallèles :
+- scan_and_trade_loop : scan de nouveaux tokens + ouverture de trades (5 min)
+- position_monitor_loop : vérification SL/TP/Trailing/Timeout (60s)
+- report_scheduler : rapports quotidiens/hebdo + alertes BTC (60s)
+
+Le découplage scan/positions corrige un problème où le trailing stop
+pouvait rater le vrai pic d'un token entre deux scans espacés de 5 min,
+menant à des fermetures à un PnL bien inférieur à ce qu'elles auraient dû.
 """
 import asyncio
 import logging
@@ -53,6 +56,9 @@ _last_report_week = -1
 _notified_signals: dict = {}
 _SIGNAL_COOLDOWN_HOURS = 4
 
+# ← NOUVEAU : intervalle dédié à la vérification des positions
+POSITION_CHECK_INTERVAL_SECONDS = 60
+
 
 def handle_shutdown(signum, frame):
     global _running
@@ -74,6 +80,8 @@ def _init_trader():
     return PaperTrader(), "paper"
 
 
+# ── Boucle 1 : scan de nouveaux tokens + ouverture de trades ──────────────────
+
 async def scan_and_trade_loop():
     logger.info("🚀 Bot démarré | Mode: %s | Score min: %d",
                 config.TRADING_MODE, config.MIN_SCORE_TO_TRADE)
@@ -83,7 +91,7 @@ async def scan_and_trade_loop():
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error("Erreur boucle principale: %s", e, exc_info=True)
+            logger.error("Erreur boucle scan: %s", e, exc_info=True)
         logger.info("Prochain scan dans %ds...", config.SCAN_INTERVAL_SECONDS)
         for _ in range(config.SCAN_INTERVAL_SECONDS):
             if not _running:
@@ -97,20 +105,19 @@ async def _one_scan_cycle():
 
     # 1. Scanner
     raw_tokens = await scan_all()
-
     if not raw_tokens:
         logger.info("Aucun token trouvé")
-        # ← FIX : même sans tokens scannés, on vérifie les positions ouvertes
-        closed_trades = await _check_close_trades({})
-        for ct in closed_trades:
-            await tg.notify_trade_close(ct)
         return
 
     # 2. Filtrer
     filtered = apply_filters(raw_tokens)
     logger.info("%d tokens après filtrage", len(filtered))
 
-    # 3. Scorer les tokens filtrés
+    if not filtered:
+        logger.info("Aucun token après filtrage — pas de nouveau signal")
+        return
+
+    # 3. Scorer
     model = get_model()
     scored = []
     for token in filtered:
@@ -127,10 +134,6 @@ async def _one_scan_cycle():
             t.get("price_change_1h", 0), t.get("liquidity_usd", 0),
         )
 
-    # ← FIX : current_prices vient de TOUS les tokens scannés (raw_tokens),
-    #    pas seulement ceux qui passent les filtres. Une position ouverte
-    #    sur un token qui ne passe plus les filtres doit quand même
-    #    être surveillée pour SL/TP/Trailing/Timeout.
     current_prices = {
         t["address"]: t["price_usd"]
         for t in raw_tokens
@@ -140,18 +143,7 @@ async def _one_scan_cycle():
     # 4. Vérifier alertes de prix
     await tg.check_price_alerts(current_prices)
 
-    # ── 5. Vérifier les positions AVANT tout traitement des signaux ────────
-    #    Cette étape ne dépend plus de filtered — elle se fait toujours.
-    closed_trades = await _check_close_trades(current_prices)
-    for ct in closed_trades:
-        await tg.notify_trade_close(ct)
-
-    # 6. Si aucun token filtré, pas de nouveau signal possible — on s'arrête là
-    if not filtered:
-        logger.info("Aucun token après filtrage — pas de nouveau signal")
-        return
-
-    # 7. Signaux et trades
+    # 5. Signaux et trades
     if tg.is_paused():
         logger.info("Bot en pause — pas de nouveau trade")
     else:
@@ -185,7 +177,7 @@ async def _one_scan_cycle():
                 await tg.notify_trade_open(trade)
                 db.record_signal(token, score, acted=True, reason="trade_opened")
 
-    # 8. Réentraînement ML
+    # 6. Réentraînement ML
     if should_retrain():
         was_trained = model.is_trained
         logger.info("Lancement réentraînement ML...")
@@ -224,11 +216,56 @@ def _open_trade(token: dict, score: int):
     return None
 
 
+# ── Boucle 2 : surveillance des positions ouvertes (rapide, 60s) ──────────────
+
+async def position_monitor_loop():
+    """
+    Boucle dédiée et rapide pour vérifier SL/TP/Trailing/Timeout.
+    Tourne indépendamment du scan de nouveaux tokens pour ne pas rater
+    de mouvements de prix rapides sur les positions déjà ouvertes.
+    """
+    logger.info(
+        "🔍 Surveillance des positions démarrée (toutes les %ds)",
+        POSITION_CHECK_INTERVAL_SECONDS
+    )
+    while _running:
+        try:
+            await _check_positions_only()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Erreur surveillance positions: %s", e, exc_info=True)
+
+        for _ in range(POSITION_CHECK_INTERVAL_SECONDS):
+            if not _running:
+                break
+            await asyncio.sleep(1)
+
+
+async def _check_positions_only():
+    """
+    Récupère le prix actuel des positions ouvertes uniquement
+    (pas un scan complet) et vérifie SL/TP/Trailing/Timeout.
+    """
+    open_trades = db.get_open_trades()
+    if not open_trades:
+        return
+
+    # current_prices vide ici — fetch_missing_prices() dans paper_trader.py
+    # va automatiquement chercher les prix manquants pour TOUTES les positions
+    # ouvertes via DexScreener, donc pas besoin de scanner tout le marché.
+    closed_trades = await _check_close_trades({})
+    for ct in closed_trades:
+        await tg.notify_trade_close(ct)
+
+
 async def _check_close_trades(current_prices: dict) -> list:
     if hasattr(_trader, "check_and_close_trades"):
         return await _trader.check_and_close_trades(current_prices)
     return []
 
+
+# ── Boucle 3 : rapports et alertes ─────────────────────────────────────────────
 
 async def report_scheduler():
     """Rapport quotidien + hebdo + alerte BTC + optimisation."""
@@ -236,13 +273,11 @@ async def report_scheduler():
     while _running:
         now = datetime.now(timezone.utc)
 
-        # ── Alerte BTC toutes les heures ──────────────────────────────────
         if now.minute == 0:
             await tg.check_btc_and_alert()
 
         if now.hour == config.REPORT_HOUR_UTC and _last_report_day != now.day:
 
-            # ── Rapport quotidien ──────────────────────────────────────────
             try:
                 report = generate_daily_report()
                 await tg.notify_daily_report(report)
@@ -250,7 +285,6 @@ async def report_scheduler():
             except Exception as e:
                 logger.error("Erreur rapport quotidien: %s", e)
 
-            # ── Rapport hebdomadaire (lundi) ───────────────────────────────
             week_number = now.isocalendar()[1]
             if now.weekday() == 0 and _last_report_week != week_number:
                 try:
@@ -260,7 +294,6 @@ async def report_scheduler():
                 except Exception as e:
                     logger.error("Erreur rapport hebdo: %s", e)
 
-            # ── Optimiseur ─────────────────────────────────────────────────
             optimizer_result = {}
             try:
                 optimizer_result = run_optimization()
@@ -276,7 +309,6 @@ async def report_scheduler():
             except Exception as e:
                 logger.error("Erreur optimiseur: %s", e)
 
-            # ── Analyse IA ─────────────────────────────────────────────────
             try:
                 ai_message = await run_ai_analysis(optimizer_result)
                 await tg.send(ai_message)
@@ -306,7 +338,8 @@ async def main():
             f"Mode: <b>{effective_mode.upper()}</b>\n"
             f"Score min: <b>{config.MIN_SCORE_TO_TRADE}/100</b>\n"
             f"Portfolio: <b>${config.INITIAL_PORTFOLIO:.0f}</b>\n"
-            f"Scan: toutes les <b>{config.SCAN_INTERVAL_SECONDS // 60}min</b>\n\n"
+            f"Scan tokens: toutes les <b>{config.SCAN_INTERVAL_SECONDS // 60}min</b>\n"
+            f"Surveillance positions: toutes les <b>{POSITION_CHECK_INTERVAL_SECONDS}s</b>\n\n"
             f"TP1: +20% (50%) | TP2: +40% | SL: -10%\n"
             f"Trailing actif à +15% | ⏰ 24h\n\n"
             f"/help pour les commandes"
@@ -320,6 +353,7 @@ async def main():
     try:
         await asyncio.gather(
             scan_and_trade_loop(),
+            position_monitor_loop(),
             report_scheduler(),
             return_exceptions=True,
         )
