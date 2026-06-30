@@ -59,7 +59,10 @@ def init_db():
             pnl_pct         REAL,
             success         INTEGER,
             token_data      TEXT,
-            notes           TEXT
+            notes           TEXT,
+            tp1_hit         INTEGER DEFAULT 0,
+            tp1_pnl_pct     REAL,
+            tp1_at          TEXT
         );
 
         CREATE TABLE IF NOT EXISTS signals (
@@ -88,6 +91,20 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);
         CREATE INDEX IF NOT EXISTS idx_signals_score ON signals(ai_score);
         """)
+
+        # Migration : ajouter les colonnes TP1 si la table existait déjà sans elles
+        cur.execute("PRAGMA table_info(trades)")
+        existing_cols = {row["name"] for row in cur.fetchall()}
+        if "tp1_hit" not in existing_cols:
+            cur.execute("ALTER TABLE trades ADD COLUMN tp1_hit INTEGER DEFAULT 0")
+            logger.info("Migration: colonne tp1_hit ajoutée")
+        if "tp1_pnl_pct" not in existing_cols:
+            cur.execute("ALTER TABLE trades ADD COLUMN tp1_pnl_pct REAL")
+            logger.info("Migration: colonne tp1_pnl_pct ajoutée")
+        if "tp1_at" not in existing_cols:
+            cur.execute("ALTER TABLE trades ADD COLUMN tp1_at TEXT")
+            logger.info("Migration: colonne tp1_at ajoutée")
+
     logger.info("Base de données initialisée: %s", config.DB_PATH)
 
 
@@ -109,6 +126,20 @@ def open_trade(token: dict, entry_price: float, position_usd: float, ai_score: i
             ai_score, datetime.now(timezone.utc).isoformat(), json.dumps(token),
         ))
         return cur.lastrowid
+
+
+def mark_tp1_hit(trade_id: int, pnl_pct: float):
+    """
+    Enregistre qu'un trade a touché TP1 (sortie partielle) sans le fermer.
+    Le trade reste 'open' pour le reste de la position, mais on garde une trace
+    du signal positif pour l'entraînement ML.
+    """
+    with db_cursor() as cur:
+        cur.execute("""
+            UPDATE trades SET
+                tp1_hit = 1, tp1_pnl_pct = ?, tp1_at = ?
+            WHERE id = ?
+        """, (round(pnl_pct, 2), datetime.now(timezone.utc).isoformat(), trade_id))
 
 
 def close_trade(trade_id: int, exit_price: float, reason: str) -> dict:
