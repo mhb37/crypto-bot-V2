@@ -2,13 +2,16 @@
 Point d'entrée principal — Meme Coin Scanner & Trading Bot.
 
 Architecture à 3 boucles parallèles :
-- scan_and_trade_loop : scan de nouveaux tokens + ouverture de trades (5 min)
-- position_monitor_loop : vérification SL/TP/Trailing/Timeout (60s)
-- report_scheduler : rapports quotidiens/hebdo + alertes BTC (60s)
+- scan_and_trade_loop : scan nouveaux tokens (5 min)
+- position_monitor_loop : vérification positions + suivi post-trade (60s)
+- report_scheduler : rapports + alertes BTC (60s)
 
-Le découplage scan/positions corrige un problème où le trailing stop
-pouvait rater le vrai pic d'un token entre deux scans espacés de 5 min,
-menant à des fermetures à un PnL bien inférieur à ce qu'elles auraient dû.
+Changements récents :
+- Score minimum à 65 (au lieu de 55)
+- SL à -15% (au lieu de -10%)
+- Suivi post-trade 2h après chaque fermeture
+- Vérification positions indépendante du scan
+- Notification spéciale premier passage en mode ML
 """
 import asyncio
 import logging
@@ -32,7 +35,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(_data_dir, "bot.log"), encoding="utf-8"),
+        logging.FileHandler(
+            os.path.join(_data_dir, "bot.log"), encoding="utf-8"
+        ),
     ],
 )
 logger = logging.getLogger("main")
@@ -55,9 +60,8 @@ _last_report_day = -1
 _last_report_week = -1
 _notified_signals: dict = {}
 _SIGNAL_COOLDOWN_HOURS = 4
-
-# ← NOUVEAU : intervalle dédié à la vérification des positions
 POSITION_CHECK_INTERVAL_SECONDS = 60
+MIN_SCORE_TO_TRADE = 65  # ← hardcodé ici, indépendant de la variable Railway
 
 
 def handle_shutdown(signum, frame):
@@ -80,11 +84,13 @@ def _init_trader():
     return PaperTrader(), "paper"
 
 
-# ── Boucle 1 : scan de nouveaux tokens + ouverture de trades ──────────────────
+# ── Boucle 1 : scan nouveaux tokens ──────────────────────────────────────────
 
 async def scan_and_trade_loop():
-    logger.info("🚀 Bot démarré | Mode: %s | Score min: %d",
-                config.TRADING_MODE, config.MIN_SCORE_TO_TRADE)
+    logger.info(
+        "🚀 Bot démarré | Mode: %s | Score min: %d",
+        config.TRADING_MODE, MIN_SCORE_TO_TRADE
+    )
     while _running:
         try:
             await _one_scan_cycle()
@@ -129,55 +135,62 @@ async def _one_scan_cycle():
 
     for t in scored[:5]:
         logger.info(
-            " 📊 %s (%s) | Score: %d | +%.1f%% 1h | Liq: $%.0f",
+            " 📊 %s (%s) | Score: %d | +%.1f%% 1h | "
+            "+%.1f%% 6h | +%.1f%% 24h | Liq: $%.0f",
             t["symbol"], t["chain"], t["ai_score"],
-            t.get("price_change_1h", 0), t.get("liquidity_usd", 0),
+            t.get("price_change_1h", 0),
+            t.get("price_change_6h", 0),
+            t.get("price_change_24h", 0),
+            t.get("liquidity_usd", 0),
         )
 
+    # 4. Prix courants pour alertes
     current_prices = {
         t["address"]: t["price_usd"]
         for t in raw_tokens
         if t.get("address") and t.get("price_usd", 0) > 0
     }
 
-    # 4. Vérifier alertes de prix
+    # 5. Vérifier alertes de prix
     await tg.check_price_alerts(current_prices)
 
-    # 5. Signaux et trades
+    # 6. Signaux et trades
     if tg.is_paused():
         logger.info("Bot en pause — pas de nouveau trade")
-    else:
-        for token in scored:
-            score = token["ai_score"]
-            address = token.get("address", "")
+        return
 
-            db.record_signal(token, score)
+    for token in scored:
+        score = token["ai_score"]
+        address = token.get("address", "")
 
-            if score < config.MIN_SCORE_TO_TRADE:
-                continue
+        db.record_signal(token, score)
 
-            last_notified = _notified_signals.get(address)
-            cooldown = timedelta(hours=_SIGNAL_COOLDOWN_HOURS)
-            already_notified = last_notified and (now - last_notified) < cooldown
+        if score < MIN_SCORE_TO_TRADE:
+            continue
 
-            if already_notified:
-                continue
+        last_notified = _notified_signals.get(address)
+        cooldown = timedelta(hours=_SIGNAL_COOLDOWN_HOURS)
+        already_notified = (
+            last_notified and (now - last_notified) < cooldown
+        )
+        if already_notified:
+            continue
 
-            _notified_signals[address] = now
+        _notified_signals[address] = now
 
-            cutoff = now - timedelta(hours=24)
-            stale = [a for a, t in _notified_signals.items() if t < cutoff]
-            for a in stale:
-                del _notified_signals[a]
+        cutoff = now - timedelta(hours=24)
+        stale = [a for a, t in _notified_signals.items() if t < cutoff]
+        for a in stale:
+            del _notified_signals[a]
 
-            await tg.notify_signal(token, score)
+        await tg.notify_signal(token, score)
 
-            trade = _open_trade(token, score)
-            if trade:
-                await tg.notify_trade_open(trade)
-                db.record_signal(token, score, acted=True, reason="trade_opened")
+        trade = _open_trade(token, score)
+        if trade:
+            await tg.notify_trade_open(trade)
+            db.record_signal(token, score, acted=True, reason="trade_opened")
 
-    # 6. Réentraînement ML
+    # 7. Réentraînement ML
     if should_retrain():
         was_trained = model.is_trained
         logger.info("Lancement réentraînement ML...")
@@ -194,12 +207,9 @@ async def _one_scan_cycle():
                     f"📊 Samples: <b>{result.get('samples', 0)}</b>\n"
                     f"🎯 Accuracy: <b>{result.get('accuracy', 0):.1%}</b>\n"
                     f"🎯 Precision: <b>{result.get('precision', 0):.1%}</b>\n\n"
-                    f"<i>À partir de maintenant, le scoring des tokens va se "
-                    f"baser sur les patterns appris de tes trades passés, "
-                    f"pas sur la formule fixe d'avant. Surveille bien les "
-                    f"prochains résultats — le comportement du bot peut "
-                    f"changer.</i>\n\n"
-                    f"Vérifiable à tout moment avec /status."
+                    f"<i>Le scoring va maintenant se baser sur tes trades "
+                    f"passés. Le comportement du bot peut changer.</i>\n\n"
+                    f"Vérifiable avec /status."
                 )
             else:
                 await tg.send(
@@ -216,47 +226,41 @@ def _open_trade(token: dict, score: int):
     return None
 
 
-# ── Boucle 2 : surveillance des positions ouvertes (rapide, 60s) ──────────────
+# ── Boucle 2 : surveillance positions + suivi post-trade ─────────────────────
 
 async def position_monitor_loop():
-    """
-    Boucle dédiée et rapide pour vérifier SL/TP/Trailing/Timeout.
-    Tourne indépendamment du scan de nouveaux tokens pour ne pas rater
-    de mouvements de prix rapides sur les positions déjà ouvertes.
-    """
     logger.info(
-        "🔍 Surveillance des positions démarrée (toutes les %ds)",
+        "🔍 Surveillance positions démarrée (toutes les %ds)",
         POSITION_CHECK_INTERVAL_SECONDS
     )
     while _running:
         try:
-            await _check_positions_only()
+            await _check_positions_and_post_trade()
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error("Erreur surveillance positions: %s", e, exc_info=True)
-
         for _ in range(POSITION_CHECK_INTERVAL_SECONDS):
             if not _running:
                 break
             await asyncio.sleep(1)
 
 
-async def _check_positions_only():
-    """
-    Récupère le prix actuel des positions ouvertes uniquement
-    (pas un scan complet) et vérifie SL/TP/Trailing/Timeout.
-    """
-    open_trades = db.get_open_trades()
-    if not open_trades:
-        return
+async def _check_positions_and_post_trade():
+    """Vérifie les positions ouvertes ET les suivis post-trade."""
 
-    # current_prices vide ici — fetch_missing_prices() dans paper_trader.py
-    # va automatiquement chercher les prix manquants pour TOUTES les positions
-    # ouvertes via DexScreener, donc pas besoin de scanner tout le marché.
-    closed_trades = await _check_close_trades({})
-    for ct in closed_trades:
-        await tg.notify_trade_close(ct)
+    # 1. Positions ouvertes — prix vide, fetch_missing_prices s'en occupe
+    open_trades = db.get_open_trades()
+    if open_trades:
+        closed_trades = await _check_close_trades({})
+        for ct in closed_trades:
+            await tg.notify_trade_close(ct)
+
+    # 2. Suivi post-trade
+    if hasattr(_trader, "check_post_trade_tracking"):
+        completed = await _trader.check_post_trade_tracking()
+        for result in completed:
+            await tg.notify_post_trade_analysis(result)
 
 
 async def _check_close_trades(current_prices: dict) -> list:
@@ -265,7 +269,7 @@ async def _check_close_trades(current_prices: dict) -> list:
     return []
 
 
-# ── Boucle 3 : rapports et alertes ─────────────────────────────────────────────
+# ── Boucle 3 : rapports et alertes ───────────────────────────────────────────
 
 async def report_scheduler():
     """Rapport quotidien + hebdo + alerte BTC + optimisation."""
@@ -273,11 +277,13 @@ async def report_scheduler():
     while _running:
         now = datetime.now(timezone.utc)
 
+        # Alerte BTC toutes les heures pile
         if now.minute == 0:
             await tg.check_btc_and_alert()
 
         if now.hour == config.REPORT_HOUR_UTC and _last_report_day != now.day:
 
+            # Rapport quotidien
             try:
                 report = generate_daily_report()
                 await tg.notify_daily_report(report)
@@ -285,6 +291,7 @@ async def report_scheduler():
             except Exception as e:
                 logger.error("Erreur rapport quotidien: %s", e)
 
+            # Rapport hebdomadaire (lundi)
             week_number = now.isocalendar()[1]
             if now.weekday() == 0 and _last_report_week != week_number:
                 try:
@@ -294,13 +301,15 @@ async def report_scheduler():
                 except Exception as e:
                     logger.error("Erreur rapport hebdo: %s", e)
 
+            # Optimiseur
             optimizer_result = {}
             try:
                 optimizer_result = run_optimization()
                 changes = optimizer_result.get("changes", [])
                 if changes:
                     change_lines = "\n".join(
-                        f"• {c['param']}: {c['old']} → <b>{c['new']}</b>\n ↳ {c['reason']}"
+                        f"• {c['param']}: {c['old']} → <b>{c['new']}</b>\n"
+                        f" ↳ {c['reason']}"
                         for c in changes
                     )
                     await tg.send(
@@ -309,6 +318,7 @@ async def report_scheduler():
             except Exception as e:
                 logger.error("Erreur optimiseur: %s", e)
 
+            # Analyse IA
             try:
                 ai_message = await run_ai_analysis(optimizer_result)
                 await tg.send(ai_message)
@@ -317,6 +327,8 @@ async def report_scheduler():
 
         await asyncio.sleep(60)
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
     global _trader
@@ -336,12 +348,15 @@ async def main():
         await tg.send(
             f"🤖 <b>Meme Coin Bot démarré!</b>\n\n"
             f"Mode: <b>{effective_mode.upper()}</b>\n"
-            f"Score min: <b>{config.MIN_SCORE_TO_TRADE}/100</b>\n"
+            f"Score min: <b>{MIN_SCORE_TO_TRADE}/100</b>\n"
             f"Portfolio: <b>${config.INITIAL_PORTFOLIO:.0f}</b>\n"
-            f"Scan tokens: toutes les <b>{config.SCAN_INTERVAL_SECONDS // 60}min</b>\n"
-            f"Surveillance positions: toutes les <b>{POSITION_CHECK_INTERVAL_SECONDS}s</b>\n\n"
-            f"TP1: +20% (50%) | TP2: +40% | SL: -10%\n"
-            f"Trailing actif à +15% | ⏰ 24h\n\n"
+            f"Scan tokens: toutes les "
+            f"<b>{config.SCAN_INTERVAL_SECONDS // 60}min</b>\n"
+            f"Surveillance: toutes les "
+            f"<b>{POSITION_CHECK_INTERVAL_SECONDS}s</b>\n\n"
+            f"TP1: +20% (50%) | TP2: +40% | SL: -15%\n"
+            f"Trailing actif à +15% | ⏰ 24h\n"
+            f"Suivi post-trade: 2h après fermeture\n\n"
             f"/help pour les commandes"
         )
     else:
