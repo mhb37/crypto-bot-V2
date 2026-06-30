@@ -29,7 +29,7 @@ MIN_PRICE_CHANGE_24H = float(os.getenv("MIN_PRICE_CHANGE_24H", "10")) # +10% in 
 MIN_SCORE_TO_TRADE = int(os.getenv("MIN_SCORE_TO_TRADE", "70"))   # 0-100
 MODEL_PATH = os.getenv("MODEL_PATH", "models/scoring_model.pkl")
 RETRAIN_INTERVAL_DAYS = int(os.getenv("RETRAIN_INTERVAL_DAYS", "7"))
-MIN_TRADES_FOR_RETRAIN = int(os.getenv("MIN_TRADES_FOR_RETRAIN", "20"))
+MIN_TRADES_FOR_RETRAIN = int(os.getenv("MIN_TRADES_FOR_RETRAIN", "50"))
 
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "data/trading.db")
