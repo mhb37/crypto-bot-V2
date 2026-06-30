@@ -1,7 +1,7 @@
 """
 Moteur de paper trading.
 - Trailing Stop activé à +15%, distance 10%
-- Multi-TP : 50% à +20%, 50% à +40%
+- Multi-TP : 50% à +20% (enregistré en DB via tp1_hit), 50% à +40%
 - Blacklist automatique 48h après SL
 - TP: +30% / SL: -10% / Timeout: 24h
 """
@@ -16,26 +16,22 @@ import database as db
 logger = logging.getLogger(__name__)
 
 # ── Stratégie de sortie ───────────────────────────────────────────────────────
-TAKE_PROFIT_PCT      = 0.30   # TP final (si pas de multi-TP)
-STOP_LOSS_PCT        = 0.10   # SL initial
-MAX_HOLD_HOURS       = 24     # Timeout
+TAKE_PROFIT_PCT      = 0.30
+STOP_LOSS_PCT        = 0.10
+MAX_HOLD_HOURS       = 24
 
-# Trailing Stop
-TRAILING_ACTIVATE    = 0.15   # S'active à +15%
-TRAILING_DISTANCE    = 0.10   # SL remonte à (peak - 10%)
+TRAILING_ACTIVATE    = 0.15
+TRAILING_DISTANCE    = 0.10
 
-# Multi-TP
-TP1_PCT              = 0.20   # Premier TP à +20%
-TP1_SIZE             = 0.50   # Ferme 50% de la position
-TP2_PCT              = 0.40   # Deuxième TP à +40%
+TP1_PCT              = 0.20
+TP1_SIZE             = 0.50
+TP2_PCT              = 0.40
 
-# Blacklist
-BLACKLIST_HOURS      = 48     # Durée blacklist après SL
+BLACKLIST_HOURS      = 48
 
-# État en mémoire
-_peak_prices: dict[str, float] = {}        # {address: prix_max_atteint}
-_tp1_done: dict[str, bool] = {}            # {trade_id: tp1_déjà_exécuté}
-_blacklist: dict[str, datetime] = {}       # {address: expiration}
+_peak_prices: dict[str, float] = {}
+_tp1_done: dict[str, bool] = {}
+_blacklist: dict[str, datetime] = {}
 
 
 def is_blacklisted(address: str) -> bool:
@@ -65,7 +61,6 @@ class PaperTrader:
         self.portfolio_value = config.INITIAL_PORTFOLIO + realized_pnl
 
     def can_trade(self, token_address: str) -> tuple[bool, str]:
-        # Vérifier blacklist
         if is_blacklisted(token_address):
             return False, "Token en blacklist (SL récent)"
 
@@ -92,7 +87,6 @@ class PaperTrader:
 
         trade_id = db.open_trade(token, entry_price, position_usd, ai_score)
 
-        # Init trailing et multi-TP
         _peak_prices[token["address"]] = entry_price
         _tp1_done[str(trade_id)] = False
 
@@ -155,7 +149,8 @@ class PaperTrader:
     async def check_and_close_trades(self, current_prices: dict[str, float]) -> list[dict]:
         """
         Vérifie SL / Trailing Stop / Multi-TP / Timeout.
-        Retourne la liste des trades fermés (ou partiellement fermés).
+        Le TP1 est désormais enregistré en DB (tp1_hit) pour l'entraînement ML,
+        sans fermer le trade.
         """
         closed = []
         open_trades = db.get_open_trades()
@@ -198,7 +193,6 @@ class PaperTrader:
                         "📉 Trailing SL #%d | %s | Peak: +%.1f%% | PnL final: %.2f%%",
                         trade["id"], symbol, peak_pnl_pct, pnl_pct
                     )
-                    # Pas de blacklist sur trailing stop (sortie positive probable)
                     _peak_prices.pop(addr, None)
                     _tp1_done.pop(trade_id, None)
                     closed.append({**closed_trade, "reason": "trailing_stop"})
@@ -216,17 +210,19 @@ class PaperTrader:
                 closed.append({**closed_trade, "reason": "stop_loss"})
                 continue
 
-            # ── Multi-TP 1 : +20% → ferme 50% ────────────────────────────
+            # ── Multi-TP 1 : +20% → enregistré en DB + fermeture 50% notifiée ──
             if pnl_pct >= TP1_PCT * 100 and not _tp1_done.get(trade_id, False):
                 _tp1_done[trade_id] = True
+                # ← CHANGEMENT : on enregistre l'événement en DB pour le ML
+                db.mark_tp1_hit(trade["id"], pnl_pct)
+
                 exit_price = current_price * (1 - 0.005)
                 partial_usd = trade["position_usd"] * TP1_SIZE
                 partial_pnl_usd = partial_usd * (pnl_pct / 100)
                 logger.info(
-                    "🟡 TP1 #%d | %s | +%.1f%% | Partiel: $%.2f profit",
+                    "🟡 TP1 #%d | %s | +%.1f%% | Partiel: $%.2f profit (enregistré en DB)",
                     trade["id"], symbol, pnl_pct, partial_pnl_usd
                 )
-                # On enregistre un trade partiel fictif pour le notifier
                 closed.append({
                     "id": trade["id"],
                     "token_symbol": symbol,
